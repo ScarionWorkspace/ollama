@@ -27,6 +27,7 @@ intentionally skipped so a developer can iterate on a local llama.cpp tree.
   It currently touches `src/llama-model-loader.cpp` and `tools/mtmd/mtmd-model.cpp`
   (the file upstream refactored and renamed from `tools/mtmd/clip.cpp`, first
   seen at b12257, upstream #31865).
+- `002-littlebit.patch` - LittleBit support (sub-1-bit models whose linear layers are stored as Q1_0 sign factors `<name>.lb_u/lb_v/lb_g[_r]`): loading in `llama-model.cpp`, the factorized product in `llama-graph.cpp`, and a fused CUDA/HIP path in `ggml-cuda/littlebit.cu`. Generated from the `littlebit` branch of https://github.com/ScarionWorkspace/llama.cpp with `scripts/make_ollama_patch.sh` in https://github.com/ScarionWorkspace/littlebit-gguf; regenerate it when that branch or `LLAMA_CPP_VERSION` changes.
 - `compat.cmake` - CMake glue that invokes the shared
   `cmake/apply-git-patches.cmake` idempotent applier (used by
   `llama/server/CMakeLists.txt`) for every `*.patch` under

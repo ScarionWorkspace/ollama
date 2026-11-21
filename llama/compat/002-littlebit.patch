@@ -1,0 +1,627 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index becd33483..627f4d156 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -41,6 +41,7 @@
+ #include "ggml-cuda/opt-step-sgd.cuh"
+ #include "ggml-cuda/out-prod.cuh"
+ #include "ggml-cuda/pad.cuh"
++#include "ggml-cuda/littlebit.cuh"
+ #include "ggml-cuda/pool2d.cuh"
+ #include "ggml-cuda/pool1d.cuh"
+ #include "ggml-cuda/quantize.cuh"
+@@ -4218,6 +4219,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    if (node->op == GGML_OP_MUL) {
++        ggml_cuda_lb_match lb;
++        if (ggml_cuda_lb_match_fusion(cgraph, i, lb)) {
++            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, lb.n_nodes, lb.outputs, lb.n_outputs)) {
++                ggml_cuda_lb_fused(*cuda_ctx, lb);
++                return lb.n_nodes - 1;
++            }
++        }
++    }
++
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
+             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
+diff --git a/ggml/src/ggml-cuda/littlebit.cu b/ggml/src/ggml-cuda/littlebit.cu
+new file mode 100644
+index 000000000..d05ee8b7d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/littlebit.cu
+@@ -0,0 +1,323 @@
++#include "littlebit.cuh"
++
++#include "ggml-impl.h"
++
++// Each lane handles 4 consecutive elements. Stage A splits the long reduction over LB_A_WARPS warps
++// per block (LB_A_ROWS rows per block share the activation loads), stage B uses one warp per row.
++#define LB_A_ROWS  4
++#define LB_A_WARPS 8
++#define LB_B_WARPS 4
++
++// signs of row elements j .. j+3 (j % 4 == 0), bit 1 -> +1, bit 0 -> -1; d is the block scale
++static __device__ __forceinline__ float4 lb_q1_0_signs4(const block_q1_0 * row, const int j, float & d) {
++    const block_q1_0 & b = row[j / QK1_0];
++    d = __half2float(b.d);
++    const int k = j % QK1_0;
++    const int q = b.qs[k / 8] >> (k % 8);
++    return make_float4(q & 1 ? 1.0f : -1.0f, q & 2 ? 1.0f : -1.0f, q & 4 ? 1.0f : -1.0f, q & 8 ? 1.0f : -1.0f);
++}
++
++static __device__ __forceinline__ float lb_dot4(const float4 a, const float4 b) {
++    return a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
++}
++
++// path q = proj*n_paths + p
++struct lb_ptrs {
++    const block_q1_0 * v[2*GGML_CUDA_LB_MAX_PROJ];
++    const block_q1_0 * u[2*GGML_CUDA_LB_MAX_PROJ];
++    const float      * g[2*GGML_CUDA_LB_MAX_PROJ];
++    float            * dst[GGML_CUDA_LB_MAX_PROJ];
++};
++
++// t[q][c][i] = sum_j V_q[i, j] * g_q[j] * x[c][j], rows r .. r_pad-1 are zero (replaces the PAD node)
++template <int ncols>
++static __global__ void lb_stage_a(const lb_ptrs ptrs, const float * __restrict__ x, float * __restrict__ t,
++        const int n_in, const int r, const int r_pad, const int64_t x_stride, const int64_t v_row_blocks) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    __shared__ float partial[LB_A_WARPS][LB_A_ROWS][ncols];
++
++    const int row0 = blockIdx.x * LB_A_ROWS; // r_pad % LB_A_ROWS == 0: all rows of a block are in one path
++    const int path = row0 / r_pad;
++    const int i0   = row0 % r_pad;
++    const int lane = threadIdx.x;
++    const int warp = threadIdx.y;
++
++    const block_q1_0 * vp = ptrs.v[path];
++    const float * g = ptrs.g[path];
++
++    float acc[LB_A_ROWS][ncols] = { { 0.0f } };
++    for (int j = 4*(warp*warp_size + lane); j < n_in; j += 4*warp_size*LB_A_WARPS) {
++        const float4 g4 = *(const float4 *) (g + j);
++        float4 xg[ncols];
++#pragma unroll
++        for (int c = 0; c < ncols; ++c) {
++            const float4 x4 = *(const float4 *) (x + c*x_stride + j);
++            xg[c] = make_float4(x4.x*g4.x, x4.y*g4.y, x4.z*g4.z, x4.w*g4.w);
++        }
++#pragma unroll
++        for (int rr = 0; rr < LB_A_ROWS; ++rr) {
++            if (i0 + rr >= r) {
++                break;
++            }
++            float d;
++            const float4 s4 = lb_q1_0_signs4(vp + (i0 + rr)*v_row_blocks, j, d);
++#pragma unroll
++            for (int c = 0; c < ncols; ++c) {
++                acc[rr][c] += d * lb_dot4(s4, xg[c]);
++            }
++        }
++    }
++
++#pragma unroll
++    for (int rr = 0; rr < LB_A_ROWS; ++rr) {
++#pragma unroll
++        for (int c = 0; c < ncols; ++c) {
++            const float sum = warp_reduce_sum<warp_size>(acc[rr][c]);
++            if (lane == 0) {
++                partial[warp][rr][c] = sum;
++            }
++        }
++    }
++    __syncthreads();
++
++    const int k = warp*warp_size + lane;
++    if (k < LB_A_ROWS*ncols) {
++        const int rr = k / ncols;
++        const int c  = k % ncols;
++        float sum = 0.0f;
++#pragma unroll
++        for (int w = 0; w < LB_A_WARPS; ++w) {
++            sum += partial[w][rr][c];
++        }
++        t[(int64_t) path*ncols*r_pad + c*r_pad + i0 + rr] = i0 + rr < r ? sum : 0.0f;
++    }
++}
++
++// y[c][o] = sum_p sum_k U_p[o, k] * t[p][c][k] (the ADD of the residual path is done here)
++template <int ncols>
++static __global__ void lb_stage_b(const lb_ptrs ptrs, const float * __restrict__ t,
++        const int n_proj, const int n_paths, const int n_out, const int r_pad, const int64_t y_stride, const int64_t u_row_blocks) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    const int row  = blockIdx.x * blockDim.y + threadIdx.y;
++    const int lane = threadIdx.x;
++    if (row >= n_proj*n_out) {
++        return;
++    }
++    const int proj = row / n_out;
++    const int o    = row % n_out;
++
++    float acc[ncols] = { 0.0f };
++    for (int p = 0; p < n_paths; ++p) {
++        const int q = proj*n_paths + p;
++        const block_q1_0 * urow = ptrs.u[q] + o*u_row_blocks;
++        const float * tp = t + (int64_t) q * ncols * r_pad;
++        for (int k = 4*lane; k < r_pad; k += 4*warp_size) {
++            float d;
++            const float4 s4 = lb_q1_0_signs4(urow, k, d);
++#pragma unroll
++            for (int c = 0; c < ncols; ++c) {
++                acc[c] += d * lb_dot4(s4, *(const float4 *) (tp + c*r_pad + k));
++            }
++        }
++    }
++
++#pragma unroll
++    for (int c = 0; c < ncols; ++c) {
++        const float sum = warp_reduce_sum<warp_size>(acc[c]);
++        if (lane == 0) {
++            ptrs.dst[proj][c*y_stride + o] = sum;
++        }
++    }
++}
++
++// MUL(x, g) -> MUL_MAT(v, .) [-> PAD] -> MUL_MAT(u, .), as built by build_lb_mm in llama-graph.cpp
++static bool lb_match_path(const ggml_cgraph * cgraph, int idx, int & n, const ggml_tensor *& x,
++                          const ggml_tensor *& v, const ggml_tensor *& u, const ggml_tensor *& g) {
++    if (idx + 3 > cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * mul = cgraph->nodes[idx];
++    const ggml_tensor * mmv = cgraph->nodes[idx + 1];
++    if (mul->op != GGML_OP_MUL || mmv->op != GGML_OP_MUL_MAT || mmv->src[1] != mul) {
++        return false;
++    }
++    int k = idx + 2;
++    const ggml_tensor * pad = nullptr;
++    if (cgraph->nodes[k]->op == GGML_OP_PAD) {
++        pad = cgraph->nodes[k];
++        if (pad->src[0] != mmv) {
++            return false;
++        }
++        const int32_t * pp = (const int32_t *) pad->op_params;
++        if (pp[0] != 0 || pp[2] != 0 || pp[3] != 0 || pp[4] != 0 || pp[5] != 0 || pp[6] != 0 || pp[7] != 0 || pp[8] != 0) {
++            return false;
++        }
++        k++;
++        if (k >= cgraph->n_nodes) {
++            return false;
++        }
++    }
++    const ggml_tensor * mmu = cgraph->nodes[k];
++    if (mmu->op != GGML_OP_MUL_MAT || mmu->src[1] != (pad ? pad : mmv)) {
++        return false;
++    }
++
++    x = mul->src[0];
++    g = mul->src[1];
++    v = mmv->src[0];
++    u = mmu->src[0];
++
++    if (v->type != GGML_TYPE_Q1_0 || u->type != GGML_TYPE_Q1_0 || x->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (!ggml_is_contiguous(x) || !ggml_is_contiguous(v) || !ggml_is_contiguous(u) || !ggml_is_contiguous(g)) {
++        return false;
++    }
++    if (ggml_nrows(g) != 1 || g->ne[0] != x->ne[0] || x->ne[2] != 1 || x->ne[3] != 1 || x->ne[1] > GGML_CUDA_LB_MAX_TOKENS) {
++        return false;
++    }
++    if (v->ne[0] != x->ne[0] || u->ne[0] < v->ne[1] || u->ne[0] % QK1_0 != 0 || v->ne[2] != 1 || u->ne[2] != 1) {
++        return false;
++    }
++    if (!pad && u->ne[0] != v->ne[1]) {
++        return false;
++    }
++    if (mmu->type != GGML_TYPE_F32 || mmv->type != GGML_TYPE_F32) {
++        return false;
++    }
++
++    n = k - idx + 1;
++    return true;
++}
++
++// one projection starting at node idx: main path, optional residual path + ADD
++static bool lb_match_proj(const ggml_cgraph * cgraph, int idx, int & count, const ggml_tensor *& x, ggml_cuda_lb_proj & pr) {
++    int n0 = 0;
++    if (!lb_match_path(cgraph, idx, n0, x, pr.v[0], pr.u[0], pr.g[0])) {
++        return false;
++    }
++    const ggml_tensor * mmu0 = cgraph->nodes[idx + n0 - 1];
++    count  = n0;
++    pr.dst = (ggml_tensor *) mmu0;
++    pr.v[1] = pr.u[1] = pr.g[1] = nullptr;
++
++    int n1 = 0;
++    const ggml_tensor * x1 = nullptr;
++    ggml_cuda_lb_proj res;
++    if (lb_match_path(cgraph, idx + n0, n1, x1, res.v[0], res.u[0], res.g[0]) && x1 == x && idx + n0 + n1 < cgraph->n_nodes) {
++        const ggml_tensor * mmu1 = cgraph->nodes[idx + n0 + n1 - 1];
++        ggml_tensor * add = cgraph->nodes[idx + n0 + n1];
++        const bool same_shape = res.v[0]->ne[1] == pr.v[0]->ne[1] && res.u[0]->ne[0] == pr.u[0]->ne[0] &&
++                                res.u[0]->ne[1] == pr.u[0]->ne[1];
++        if (add->op == GGML_OP_ADD && same_shape &&
++                ((add->src[0] == mmu0 && add->src[1] == mmu1) || (add->src[0] == mmu1 && add->src[1] == mmu0)) &&
++                add->type == GGML_TYPE_F32) {
++            pr.v[1] = res.v[0];
++            pr.u[1] = res.u[0];
++            pr.g[1] = res.g[0];
++            pr.dst  = add;
++            count   = n0 + n1 + 1;
++        }
++    }
++    return ggml_is_contiguous(pr.dst);
++}
++
++static bool lb_same_shape(const ggml_cuda_lb_proj & a, const ggml_cuda_lb_proj & b) {
++    return (a.v[1] != nullptr) == (b.v[1] != nullptr) && a.v[0]->ne[1] == b.v[0]->ne[1] &&
++           a.u[0]->ne[0] == b.u[0]->ne[0] && a.u[0]->ne[1] == b.u[0]->ne[1];
++}
++
++bool ggml_cuda_lb_match_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_lb_match & m) {
++    int count = 0;
++    if (!lb_match_proj(cgraph, node_idx, count, m.x, m.proj[0])) {
++        return false;
++    }
++    m.n_proj  = 1;
++    m.n_paths = m.proj[0].v[1] ? 2 : 1;
++    m.n_outputs = 0;
++    m.outputs[m.n_outputs++] = node_idx + count - 1;
++
++    // append following projections with the same input, skipping view nodes (e.g. a RESHAPE of the previous result)
++    while (m.n_proj < GGML_CUDA_LB_MAX_PROJ) {
++        int j = node_idx + count;
++        int views[2];
++        int n_views = 0;
++        while (j < cgraph->n_nodes && n_views < 2 && (cgraph->nodes[j]->op == GGML_OP_RESHAPE || cgraph->nodes[j]->op == GGML_OP_VIEW)) {
++            views[n_views++] = j++;
++        }
++        int n = 0;
++        const ggml_tensor * x = nullptr;
++        ggml_cuda_lb_proj pr;
++        if (j >= cgraph->n_nodes || !lb_match_proj(cgraph, j, n, x, pr) || x != m.x || !lb_same_shape(pr, m.proj[0])) {
++            break;
++        }
++        for (int k = 0; k < n_views; ++k) {
++            m.outputs[m.n_outputs++] = views[k];
++        }
++        m.proj[m.n_proj++] = pr;
++        count = j + n - node_idx;
++        m.outputs[m.n_outputs++] = node_idx + count - 1;
++    }
++
++    enum ggml_op ops[32];
++    if (count > 31) {
++        return false;
++    }
++    for (int i = 0; i < count; ++i) {
++        ops[i] = cgraph->nodes[node_idx + i]->op;
++    }
++    if (!ggml_can_fuse_subgraph(cgraph, node_idx, count, ops, m.outputs, m.n_outputs)) {
++        return false;
++    }
++    m.n_nodes = count;
++    return true;
++}
++
++template <int ncols>
++static void lb_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_lb_match & m, cudaStream_t stream) {
++    const ggml_cuda_lb_proj & p0 = m.proj[0];
++    const int n_in  = m.x->ne[0];
++    const int r     = p0.v[0]->ne[1];
++    const int r_pad = p0.u[0]->ne[0];
++    const int n_out = p0.u[0]->ne[1];
++    const int n_q   = m.n_proj * m.n_paths;
++
++    lb_ptrs ptrs = {};
++    for (int k = 0; k < m.n_proj; ++k) {
++        for (int p = 0; p < m.n_paths; ++p) {
++            ptrs.v[k*m.n_paths + p] = (const block_q1_0 *) m.proj[k].v[p]->data;
++            ptrs.u[k*m.n_paths + p] = (const block_q1_0 *) m.proj[k].u[p]->data;
++            ptrs.g[k*m.n_paths + p] = (const float *) m.proj[k].g[p]->data;
++        }
++        ptrs.dst[k] = (float *) m.proj[k].dst->data;
++    }
++
++    ggml_cuda_pool_alloc<float> t(ctx.pool(), (size_t) n_q * ncols * r_pad);
++
++    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
++    GGML_ASSERT(r_pad % LB_A_ROWS == 0 && LB_A_ROWS*ncols <= LB_A_WARPS*warp_size);
++
++    lb_stage_a<ncols><<<n_q * r_pad / LB_A_ROWS, dim3(warp_size, LB_A_WARPS, 1), 0, stream>>>(
++        ptrs, (const float *) m.x->data, t.get(), n_in, r, r_pad,
++        m.x->nb[1] / sizeof(float), p0.v[0]->nb[1] / sizeof(block_q1_0));
++
++    lb_stage_b<ncols><<<(m.n_proj*n_out + LB_B_WARPS - 1) / LB_B_WARPS, dim3(warp_size, LB_B_WARPS, 1), 0, stream>>>(
++        ptrs, t.get(), m.n_proj, m.n_paths, n_out, r_pad,
++        p0.dst->nb[1] / sizeof(float), p0.u[0]->nb[1] / sizeof(block_q1_0));
++}
++
++void ggml_cuda_lb_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_lb_match & m) {
++    cudaStream_t stream = ctx.stream();
++    switch (m.x->ne[1]) {
++        case 1: lb_launch<1>(ctx, m, stream); break;
++        case 2: lb_launch<2>(ctx, m, stream); break;
++        case 3: lb_launch<3>(ctx, m, stream); break;
++        case 4: lb_launch<4>(ctx, m, stream); break;
++        case 5: lb_launch<5>(ctx, m, stream); break;
++        case 6: lb_launch<6>(ctx, m, stream); break;
++        case 7: lb_launch<7>(ctx, m, stream); break;
++        case 8: lb_launch<8>(ctx, m, stream); break;
++        default: GGML_ABORT("unsupported number of tokens for LittleBit fusion: %lld", (long long) m.x->ne[1]);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/littlebit.cuh b/ggml/src/ggml-cuda/littlebit.cuh
+new file mode 100644
+index 000000000..d5a65dbea
+--- /dev/null
++++ b/ggml/src/ggml-cuda/littlebit.cuh
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include "common.cuh"
++
++// LittleBit linear layer (llama-graph.cpp build_lb_mm), up to 9 nodes:
++//   y = mul_mat(U, pad(mul_mat(V, x * g))) + mul_mat(U_R, pad(mul_mat(V_R, x * g_R)))
++// For few tokens each node is a tiny kernel, so run the chain as 2 kernels instead.
++// Activations stay F32 (no Q8_1), so the result is at least as exact as the unfused chain.
++
++// larger batches use the unfused path (MMQ is fast there)
++#define GGML_CUDA_LB_MAX_TOKENS 8
++// consecutive projections with the same input and shape (e.g. ffn_gate + ffn_up) share the 2 kernels
++#define GGML_CUDA_LB_MAX_PROJ 2
++
++struct ggml_cuda_lb_proj {
++    const ggml_tensor * v[2] = { nullptr, nullptr };
++    const ggml_tensor * u[2] = { nullptr, nullptr };
++    const ggml_tensor * g[2] = { nullptr, nullptr };
++    ggml_tensor * dst = nullptr; // ADD (residual) or the last MUL_MAT
++};
++
++struct ggml_cuda_lb_match {
++    int n_nodes = 0;
++    int n_proj  = 0;
++    int n_paths = 0;
++    const ggml_tensor * x = nullptr;
++    ggml_cuda_lb_proj proj[GGML_CUDA_LB_MAX_PROJ];
++    int outputs[8]; // node indices used outside the fused range
++    int n_outputs = 0;
++};
++
++bool ggml_cuda_lb_match_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_lb_match & m);
++
++void ggml_cuda_lb_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_lb_match & m);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0f7d8ab17..25d8ecb34 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1684,10 +1684,44 @@ ggml_tensor * llm_graph_context::build_rope_indexer(ggml_tensor * cur, ggml_tens
+     return rp.n_rot > 0 && rp.n_offs > 0 ? ggml_rope_set_offset(res, rp.n_offs) : res;
+ }
+ 
++ggml_tensor * llm_graph_context::build_lb_mm(
++    const llama_lb_weight & lw,
++          ggml_tensor * cur) const {
++    const auto path = [&](const llama_lb_path & p) {
++        // the row scales l (of v) and h (of u) are the Q1_0 block scales, only g is applied here
++        ggml_tensor * t = ggml_mul(ctx0, cur, p.g);
++        t = ggml_mul_mat(ctx0, p.v, t);
++        // u is padded to a multiple of the Q1_0 block size along the rank; pad the latent with zeros
++        const int64_t pad = p.u->ne[0] - t->ne[0];
++        if (pad > 0) {
++            t = ggml_pad(ctx0, t, (int) pad, 0, 0, 0);
++        }
++        return ggml_mul_mat(ctx0, p.u, t);
++    };
++
++    ggml_tensor * res = path(lw.main);
++    if (lw.res.u) {
++        res = ggml_add(ctx0, res, path(lw.res));
++    }
++    return res;
++}
++
+ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w,
+           ggml_tensor * cur,
+           ggml_tensor * w_s) const {
++    if (!model.lb.empty()) {
++        const auto it = model.lb.find(w);
++        if (it != model.lb.end()) {
++            GGML_ASSERT(loras->empty() && "LoRA adapters on LittleBit weights are not supported");
++            ggml_tensor * res = build_lb_mm(it->second, cur);
++            if (w_s) {
++                res = ggml_mul(ctx0, res, w_s);
++            }
++            return res;
++        }
++    }
++
+     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
+     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 20c43e374..056e2b634 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -20,6 +20,7 @@ struct ggml_tensor;
+ struct llama_cparams;
+ struct llama_layer;
+ struct llama_model;
++struct llama_lb_weight;
+ struct llama_prec_policy;
+ struct llama_hadamard;
+ 
+@@ -1132,6 +1133,11 @@ struct llm_graph_context {
+               ggml_tensor * cur,
+               ggml_tensor * w_s = nullptr) const;
+ 
++    // LittleBit factorized product for a weight registered in model.lb
++    ggml_tensor * build_lb_mm(
++        const llama_lb_weight & lw,
++              ggml_tensor * cur) const;
++
+     // do mat_mul_id, while optionally apply lora and per-expert scale
+     // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see build_moe_cache_slots)
+     ggml_tensor * build_lora_mm_id(
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 2cbee61d4..2036f03ba 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1285,6 +1285,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         ggml_op op;
+         if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
+             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
++        } else if (tn.suffix != nullptr && (strcmp(tn.suffix, "lb_g") == 0 || strcmp(tn.suffix, "lb_g_r") == 0)) {
++            // LittleBit input scale, multiplied elementwise into the activations
++            op = GGML_OP_MUL;
+         } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
+                 (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
+             op = GGML_OP_MUL_MAT_ID;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index dbc91a137..ca5b64d30 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -4046,6 +4046,49 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid,
+     }
+ }
+ 
++ggml_tensor * llama_model_base::create_tensor_lb(const LLM_TN_IMPL & tn_w, int64_t n_in, int64_t n_out, int flags) {
++    GGML_ASSERT(ml != nullptr);
++
++    const auto name = [&](const char * suffix) {
++        return LLM_TN_IMPL(tn_w.arch, tn_w.tensor, suffix, tn_w.bid, tn_w.xid);
++    };
++
++    const ggml_tensor * u_meta = ml->get_tensor_meta(name("lb_u").str().c_str());
++    if (u_meta == nullptr || (flags & TENSOR_SKIP)) {
++        return create_tensor(tn_w, {n_in, n_out}, flags);
++    }
++
++    const auto load_path = [&](const char * su, const char * sv, const char * sg, int path_flags) {
++        llama_lb_path p;
++        const ggml_tensor * um = ml->get_tensor_meta(name(su).str().c_str());
++        const ggml_tensor * vm = ml->get_tensor_meta(name(sv).str().c_str());
++        if (um == nullptr && vm == nullptr && (path_flags & TENSOR_NOT_REQUIRED)) {
++            return p;
++        }
++        if (um == nullptr || vm == nullptr) {
++            throw std::runtime_error(format("LittleBit tensor '%s': incomplete factor set", name(su).str().c_str()));
++        }
++        // the rank is read from the file and may differ per layer and projection
++        const int64_t r_pad = um->ne[0];
++        const int64_t r     = vm->ne[1];
++        if (r > r_pad) {
++            throw std::runtime_error(format("LittleBit tensor '%s': rank %lld > padded rank %lld",
++                    name(su).str().c_str(), (long long) r, (long long) r_pad));
++        }
++        p.u = create_tensor(name(su), {r_pad, n_out}, 0);
++        p.v = create_tensor(name(sv), {n_in,  r},     0);
++        p.g = create_tensor(name(sg), {n_in},         0);
++        return p;
++    };
++
++    llama_lb_weight lw;
++    lw.main = load_path("lb_u",   "lb_v",   "lb_g",   0);
++    lw.res  = load_path("lb_u_r", "lb_v_r", "lb_g_r", TENSOR_NOT_REQUIRED);
++
++    model->lb[lw.main.u] = lw;
++    return lw.main.u;
++}
++
+ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
+         int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
+         int flags) {
+@@ -4075,9 +4118,9 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
+             layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
+         }
+     } else {
+-        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags);
+-        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags);
+-        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", bid), {n_embd_, n_embd_v_}, flags);
++        layer.wq = create_tensor_lb(tn(LLM_TENSOR_ATTN_Q, "weight", bid), n_embd_, n_embd_q_, flags);
++        layer.wk = create_tensor_lb(tn(LLM_TENSOR_ATTN_K, "weight", bid), n_embd_, n_embd_k_, flags);
++        layer.wv = create_tensor_lb(tn(LLM_TENSOR_ATTN_V, "weight", bid), n_embd_, n_embd_v_, flags);
+         layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED);
+         layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
+         layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 9c0a51f3d..3dd48b058 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -746,6 +746,24 @@ struct llama_hadamard {
+     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
+ };
+ 
++// LittleBit: a linear layer stored as sign factors instead of a dense weight
++//   y = sum over paths of  mul_mat(u, pad(mul_mat(v, x * g)))
++// u: Q1_0 [r_pad, n_out], row scale h; v: Q1_0 [n_in, r], row scale l; g: F32 [n_in]
++// the second path (residual) is optional. See littlebit-gguf docs/FORMAT.md
++struct llama_lb_path {
++    ggml_tensor * u = nullptr;
++    ggml_tensor * v = nullptr;
++    ggml_tensor * g = nullptr;
++};
++
++struct llama_lb_weight {
++    llama_lb_path main;
++    llama_lb_path res; // all nullptr if the layer has no residual path
++};
++
++// stand-in weight tensor (= main.u) -> factors
++using llama_lb_weights = std::unordered_map<const ggml_tensor *, llama_lb_weight>;
++
+ struct llama_rope_params {
+     int32_t n_rot      = 0; // 0 if the layer has no RoPE
+     int32_t n_offs     = 0; // first rotated dim in a cached K head
+@@ -777,6 +795,9 @@ struct llama_model {
+ 
+     llama_hadamard hdmd;
+ 
++    // LittleBit factorized weights, keyed by the stand-in tensor stored in the layer (e.g. layer.wq)
++    llama_lb_weights lb;
++
+     // see llama_model_set_attn_rot
+     bool attn_rot = true;
+ 
+@@ -1069,6 +1090,11 @@ struct llama_model_base : public llama_model {
+     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
+     void load_tensors_hadamard();
+ 
++    // helper: create a dense weight {n_in, n_out}, or, if the file has LittleBit factors
++    // "<name>.lb_u/lb_v/lb_g[_r]" instead, load those and return lb_u as the stand-in weight.
++    // build_lora_mm then computes the factorized product for it.
++    ggml_tensor * create_tensor_lb(const LLM_TN_IMPL & tn, int64_t n_in, int64_t n_out, int flags);
++
+     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
+     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
+ 
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+index 7a6052970..b5bf47ff8 100644
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -38,15 +38,15 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
+         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+ 
+         create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_gqa, n_embd_gqa, 0);
+-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
++        layer.wo = create_tensor_lb(tn(LLM_TENSOR_ATTN_OUT, "weight", i), n_embd_head_k * n_head, n_embd, 0);
+ 
+         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+ 
+         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
++        layer.ffn_gate = create_tensor_lb(tn(LLM_TENSOR_FFN_GATE, "weight", i), n_embd,   n_ff, 0);
++        layer.ffn_down = create_tensor_lb(tn(LLM_TENSOR_FFN_DOWN, "weight", i),   n_ff, n_embd, 0);
++        layer.ffn_up   = create_tensor_lb(tn(LLM_TENSOR_FFN_UP,   "weight", i), n_embd,   n_ff, 0);
+     }
+ }
+ 
