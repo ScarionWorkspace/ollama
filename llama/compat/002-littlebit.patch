@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index becd33483..627f4d156 100644
+index becd33483..392050aca 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -41,6 +41,7 @@
@@ -14,7 +14,7 @@ index becd33483..627f4d156 100644
  
      ggml_tensor * node = cgraph->nodes[i];
  
-+    if (node->op == GGML_OP_MUL) {
++    if (node->op == GGML_OP_MUL && ggml_cuda_lb_fusion_enabled(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
 +        ggml_cuda_lb_match lb;
 +        if (ggml_cuda_lb_match_fusion(cgraph, i, lb)) {
 +            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, lb.n_nodes, lb.outputs, lb.n_outputs)) {
@@ -29,13 +29,16 @@ index becd33483..627f4d156 100644
              ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
 diff --git a/ggml/src/ggml-cuda/littlebit.cu b/ggml/src/ggml-cuda/littlebit.cu
 new file mode 100644
-index 000000000..2ae434504
+index 000000000..0d98c67e8
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/littlebit.cu
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,379 @@
 +#include "littlebit.cuh"
 +
 +#include "ggml-impl.h"
++
++#include <cstdlib>
++#include <cstring>
 +
 +// Each lane handles LB_CHUNK = 32 consecutive elements (a quarter Q1_0 block), so a warp covers 32 chunks per step
 +// and more loads are in flight. Stage A splits the reduction over LB_A_WARPS warps per block (LB_A_ROWS rows per
@@ -299,6 +302,21 @@ index 000000000..2ae434504
 +           a.u[0]->ne[0] == b.u[0]->ne[0] && a.u[0]->ne[1] == b.u[0]->ne[1];
 +}
 +
++bool ggml_cuda_lb_fusion_enabled(const int cc) {
++    // -1: not set, 0: off, 1: on
++    static const int forced = [] {
++        const char * env = getenv("GGML_CUDA_LB_FUSION");
++        if (env == nullptr || env[0] == '\0') {
++            return -1;
++        }
++        return (strcmp(env, "0") == 0 || strcmp(env, "off") == 0 || strcmp(env, "false") == 0) ? 0 : 1;
++    }();
++    if (forced >= 0) {
++        return forced == 1;
++    }
++    return GGML_CUDA_CC_IS_AMD(cc);
++}
++
 +bool ggml_cuda_lb_match_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_lb_match & m) {
 +    int count = 0;
 +    if (!lb_match_proj(cgraph, node_idx, count, m.x, m.proj[0])) {
@@ -396,10 +414,10 @@ index 000000000..2ae434504
 +}
 diff --git a/ggml/src/ggml-cuda/littlebit.cuh b/ggml/src/ggml-cuda/littlebit.cuh
 new file mode 100644
-index 000000000..d5a65dbea
+index 000000000..b4a2f4f8c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/littlebit.cuh
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,41 @@
 +#pragma once
 +
 +#include "common.cuh"
@@ -430,6 +448,13 @@ index 000000000..d5a65dbea
 +    int outputs[8]; // node indices used outside the fused range
 +    int n_outputs = 0;
 +};
++
++// Whether to use the fused kernels on a device of compute capability cc. Default: AMD only.
++// On an NVIDIA RTX A1000 (Ampere) the fused path measured about 2x slower than the unfused chain
++// for generation (GeniusDevam/littlebit-gguf#1), so other vendors keep the unfused chain until
++// the kernels are tuned there. GGML_CUDA_LB_FUSION=1 forces it on, =0 off, on any device.
++// GGML_CUDA_DISABLE_FUSION still turns off all fusion, this one included.
++bool ggml_cuda_lb_fusion_enabled(int cc);
 +
 +bool ggml_cuda_lb_match_fusion(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_lb_match & m);
 +
